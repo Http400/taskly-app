@@ -87,6 +87,20 @@ def test_mixed_application_change_is_eligible(repository):
     )
 
 
+def test_changed_tests_are_included_in_model_diff_context(repository):
+    base = git(repository, "rev-parse", "HEAD")
+    (repository / "backend/app/config.py").write_text("VALUE = 'head'\n")
+    new_test = repository / "backend/tests/test_new_behavior.py"
+    new_test.write_text("def test_new_behavior():\n    assert True\n")
+    head = commit(repository, "change with tests")
+
+    scope = analyze_diff(repository, base, head)
+
+    assert scope.status == "eligible"
+    assert "backend/tests/test_new_behavior.py" in scope.diff
+    assert "def test_new_behavior" in scope.diff
+
+
 def test_docs_only_change_is_normal_no_op(repository):
     base = git(repository, "rev-parse", "HEAD")
     (repository / "README.md").write_text("# Updated\n")

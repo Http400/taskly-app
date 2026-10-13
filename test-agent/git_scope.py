@@ -165,6 +165,15 @@ def is_application_path(path: str) -> bool:
     return False
 
 
+def is_test_path(path: str) -> bool:
+    pure = PurePosixPath(path)
+    if path.startswith("backend/tests/"):
+        return pure.suffix == ".py"
+    if path.startswith("frontend/src/"):
+        return pure.name.endswith((".test.ts", ".test.tsx"))
+    return False
+
+
 def is_privileged_path(path: str) -> bool:
     if path in PRIVILEGED_EXACT_PATHS:
         return True
@@ -274,6 +283,18 @@ def analyze_diff(
             0,
         )
 
+    context_paths = tuple(
+        sorted(
+            {
+                *targets,
+                *(
+                    item.path
+                    for item in changed
+                    if item.status[:1] in {"A", "M"} and is_test_path(item.path)
+                ),
+            }
+        )
+    )
     diff = run_git(
         repository,
         "diff",
@@ -282,7 +303,7 @@ def analyze_diff(
         merge_base,
         head_sha,
         "--",
-        *targets,
+        *context_paths,
     )
     diff_characters = len(diff)
     if diff_characters > max_diff_characters:
