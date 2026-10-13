@@ -7,7 +7,9 @@ from sqlalchemy import URL
 
 def resolve_database_url(database_url: str | None = None) -> str:
     load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
-    explicit_url = database_url or os.getenv("DATABASE_URL")
+    explicit_url = (
+        database_url.strip() if database_url else os.getenv("DATABASE_URL")
+    )
     if explicit_url:
         return explicit_url
     return URL.create(
