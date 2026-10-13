@@ -1,0 +1,455 @@
+name: Unit test agent
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: unit-test-agent-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+jobs:
+  scope:
+    name: Determine eligible scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      eligible: ${{ steps.inspect.outputs.eligible }}
+      status: ${{ steps.inspect.outputs.status }}
+      suite: ${{ steps.inspect.outputs.suite }}
+    steps:
+      - name: Check out trusted base tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out exact pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+          path: candidate
+          persist-credentials: false
+
+      - name: Fetch exact base commit
+        env:
+          BASE_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: git -C candidate fetch --no-tags "$BASE_URL" "$BASE_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Analyze deterministic change scope
+        run: |
+          mkdir scope
+          python trusted/test-agent/git_scope.py analyze \
+            --repository candidate \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --output scope/scope.json
+          cp trusted/test-agent/workflow.py scope/workflow.py
+
+      - name: Validate scope result
+        id: inspect
+        run: |
+          python trusted/test-agent/workflow.py inspect-scope \
+            --input scope/scope.json \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload SHA-bound scope
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-agent-scope-${{ env.HEAD_SHA }}
+          path: scope/
+          if-no-files-found: error
+          retention-days: 7
+
+  baseline:
+    name: Verify exact PR head
+    needs: scope
+    if: needs.scope.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out trusted base tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out exact pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+          path: candidate
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Materialize approved exact-head snapshot
+        run: |
+          python trusted/test-agent/git_scope.py snapshot \
+            --repository candidate \
+            --head "$HEAD_SHA" \
+            --destination snapshot
+
+      - name: Build trusted secret-free verifier
+        run: docker build -f trusted/test-agent/Dockerfile.verify -t taskly-test-verifier trusted
+
+      - name: Run ordinary tests without network or credentials
+        id: baseline
+        continue-on-error: true
+        env:
+          SUITE: ${{ needs.scope.outputs.suite }}
+        run: |
+          install -d -m 0777 baseline-output
+          docker run --rm \
+            --network none \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            --memory 2g \
+            --cpus 2 \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -v "$PWD/snapshot:/workspace:ro" \
+            -v "$PWD/baseline-output:/output:rw" \
+            taskly-test-verifier \
+            --baseline-only \
+            --suite "$SUITE" \
+            --output-dir /output
+
+      - name: Upload baseline result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-agent-baseline-${{ env.HEAD_SHA }}
+          path: baseline-output/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Preserve baseline failure
+        if: steps.baseline.outcome == 'failure'
+        run: exit 1
+
+  generate:
+    name: Generate candidate tests
+    needs: scope
+    if: >-
+      needs.scope.outputs.eligible == 'true' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !endsWith(github.actor, '[bot]') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+      github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      has_candidate: ${{ steps.inspect.outputs.has_candidate }}
+      status: ${{ steps.inspect.outputs.status }}
+      suite: ${{ steps.inspect.outputs.suite }}
+    steps:
+      - name: Check out trusted base agent
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: trusted
+          persist-credentials: false
+
+      - name: Fetch exact pull request head as data
+        env:
+          HEAD_URL: ${{ github.server_url }}/${{ github.event.pull_request.head.repo.full_name }}.git
+        run: git -C trusted fetch --no-tags "$HEAD_URL" "$HEAD_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: trusted/test-agent/requirements.txt
+
+      - name: Install trusted agent dependencies
+        run: python -m pip install --requirement trusted/test-agent/requirements.txt
+
+      - name: Run bounded test-writing agent
+        id: generation
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TEST_AGENT_MODEL: ${{ vars.TEST_AGENT_MODEL || 'gpt-6-astra' }}
+        run: |
+          mkdir generation
+          python trusted/test-agent/run.py \
+            --workspace trusted \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --output generation/generation.json \
+            --max-files 10 \
+            --max-diff-characters 30000 \
+            --max-requests 12 \
+            --max-tools 30
+
+      - name: Validate generation artifact
+        id: inspect
+        if: always()
+        run: |
+          python trusted/test-agent/workflow.py inspect-generation \
+            --input generation/generation.json \
+            --expected-head "$HEAD_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload SHA-bound generation result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-agent-generation-${{ env.HEAD_SHA }}
+          path: generation/generation.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Preserve generation failure
+        if: >-
+          steps.generation.outcome == 'failure' ||
+          steps.inspect.outcome == 'failure'
+        run: exit 1
+
+  verify:
+    name: Verify generated tests
+    needs: [scope, generate]
+    if: >-
+      always() &&
+      needs.generate.outputs.has_candidate == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out trusted base verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out exact pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+          path: candidate
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download generation artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-agent-generation-${{ env.HEAD_SHA }}
+          path: generation
+
+      - name: Revalidate candidate identity
+        run: |
+          python trusted/test-agent/workflow.py inspect-generation \
+            --input generation/generation.json \
+            --expected-head "$HEAD_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Materialize approved exact-head snapshot
+        run: |
+          python trusted/test-agent/git_scope.py snapshot \
+            --repository candidate \
+            --head "$HEAD_SHA" \
+            --destination snapshot
+
+      - name: Build trusted secret-free verifier
+        run: docker build -f trusted/test-agent/Dockerfile.verify -t taskly-test-verifier trusted
+
+      - name: Verify candidate without network or credentials
+        id: verification
+        continue-on-error: true
+        run: |
+          install -d -m 0777 verification-output
+          docker run --rm \
+            --network none \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            --memory 2g \
+            --cpus 2 \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -v "$PWD/snapshot:/workspace:ro" \
+            -v "$PWD/generation/generation.json:/input/candidate.json:ro" \
+            -v "$PWD/verification-output:/output:rw" \
+            taskly-test-verifier \
+            --candidate /input/candidate.json \
+            --output-dir /output
+
+      - name: Upload SHA-bound verification result and patch
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-agent-verification-${{ env.HEAD_SHA }}
+          path: verification-output/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Preserve verification failure
+        if: steps.verification.outcome == 'failure'
+        run: exit 1
+
+  report:
+    name: Publish agent result
+    needs: [scope, baseline, generate, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download scope and trusted report renderer
+        id: scope_artifact
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-agent-scope-${{ env.HEAD_SHA }}
+          path: report-input/scope
+
+      - name: Download baseline result
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-agent-baseline-${{ env.HEAD_SHA }}
+          path: report-input/baseline
+
+      - name: Download generation result
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-agent-generation-${{ env.HEAD_SHA }}
+          path: report-input/generation
+
+      - name: Download verification result and patch
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-agent-verification-${{ env.HEAD_SHA }}
+          path: report-input/verification
+
+      - name: Render bounded validated report
+        env:
+          SCOPE_JOB: ${{ needs.scope.result }}
+          BASELINE_JOB: ${{ needs.baseline.result }}
+          GENERATION_JOB: ${{ needs.generate.result }}
+          VERIFICATION_JOB: ${{ needs.verify.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -f report-input/scope/workflow.py ] && [ -f report-input/scope/scope.json ]; then
+            set +e
+            python report-input/scope/workflow.py render-report \
+              --scope report-input/scope/scope.json \
+              --generation report-input/generation/generation.json \
+              --verification report-input/verification/verification.json \
+              --baseline report-input/baseline/verification.json \
+              --expected-head "$HEAD_SHA" \
+              --run-url "$RUN_URL" \
+              --scope-job "$SCOPE_JOB" \
+              --baseline-job "$BASELINE_JOB" \
+              --generation-job "$GENERATION_JOB" \
+              --verification-job "$VERIFICATION_JOB" \
+              --output report.md
+            render_exit=$?
+            set -e
+          else
+            render_exit=1
+          fi
+          if [ "$render_exit" -ne 0 ]; then
+            {
+              echo '<!-- taskly-unit-test-agent -->'
+              echo '## Unit test agent'
+              echo
+              echo '**Decision:** Reporting infrastructure failure'
+              echo "**Analyzed head:** \`$HEAD_SHA\`"
+              echo
+              echo "Scope: $SCOPE_JOB; baseline: $BASELINE_JOB; generation: $GENERATION_JOB; verification: $VERIFICATION_JOB."
+              echo
+              echo "[Workflow run]($RUN_URL)"
+            } > report.md
+          fi
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update identifiable pull request comment
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REPORT_PATH: report.md
+        with:
+          script: |
+            const fs = require('fs')
+            const body = fs.readFileSync(process.env.REPORT_PATH, 'utf8')
+            const pullNumber = context.payload.pull_request.number
+            const current = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullNumber,
+            })
+            if (current.data.head.sha !== process.env.HEAD_SHA) {
+              core.notice('Skipping stale PR comment update for an older head SHA')
+              return
+            }
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pullNumber,
+                per_page: 100,
+              },
+            )
+            const existing = comments.find(
+              (comment) =>
+                comment.user?.login === 'github-actions[bot]' &&
+                comment.body?.includes('<!-- taskly-unit-test-agent -->'),
+            )
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              })
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pullNumber,
+                body,
+              })
+            }

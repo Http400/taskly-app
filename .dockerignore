@@ -1,0 +1,12 @@
+**
+!backend/
+backend/*
+!backend/requirements.txt
+!frontend/
+frontend/*
+!frontend/package.json
+!frontend/package-lock.json
+!test-agent/
+test-agent/*
+!test-agent/verify.py
+!test-agent/Dockerfile.verify

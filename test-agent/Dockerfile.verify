@@ -1,0 +1,26 @@
+FROM node:22.12.0-slim AS node-runtime
+
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+RUN useradd --create-home --uid 10001 verifier
+WORKDIR /opt/test-agent
+
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
+COPY backend/requirements.txt /tmp/backend-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/backend-requirements.txt
+
+COPY frontend/package.json frontend/package-lock.json /opt/frontend/
+RUN cd /opt/frontend && npm ci
+
+COPY test-agent/verify.py /opt/test-agent/verify.py
+RUN mkdir /workspace && chown verifier:verifier /workspace
+
+USER verifier
+WORKDIR /workspace
+ENTRYPOINT ["python", "/opt/test-agent/verify.py"]
