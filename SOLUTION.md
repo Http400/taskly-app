@@ -209,11 +209,31 @@ head `f30e3a4`. The agent made 8 model requests and 9 tool calls, loaded
 `analyze-changes` and `backend-unit-tests`, and produced a patch that passed a
 green 21-test baseline and 25-test candidate run in the isolated verifier.
 
-## Bootstrap and current limitation
+## Real GitHub evidence
+
+The workflow was bootstrapped on `main` in commit `7d481d2`, then exercised by
+[PR #1](https://github.com/Http400/taskly-app/pull/1) from the same repository.
+
+[Run 38447123242](https://github.com/Http400/taskly-app/actions/runs/38447123242)
+analyzed head `6172aa4eaf97bb2c8d1f4bc20153d7b1e02caa1f`. All five jobs
+completed successfully after the repository secret was configured. The agent
+loaded `analyze-changes` and `backend-unit-tests`, proposed
+`backend/tests/test_config_whitespace.py`, and published a verified patch.
+The exact-head baseline passed 37 tests; the candidate passed 40.
+
+The verified patch was applied in follow-up commit `5e991ed`. A context-selection
+issue exposed by that run was fixed on the trusted base, adding changed tests to
+the bounded model diff. [Run
+38448396047](https://github.com/Http400/taskly-app/actions/runs/38448396047)
+then analyzed updated head `474f126f8efd270cb2dcb228e45283e4d9cd729d`.
+It read the applied test, returned an evidence-based `no_tests_needed` decision,
+passed the 40-test baseline, skipped candidate verification normally, and
+updated the existing marked PR comment rather than creating a duplicate.
+
+## Bootstrap and demonstration
 
 The workflow must exist on the trusted base branch before a demonstration pull
-request can use it. Bootstrap this implementation first, then create a branch
-such as `feature/demo` with:
+request can use it. This repository uses:
 
 ```text
 Base repository: Http400/taskly-app
@@ -222,8 +242,7 @@ Head repository: Http400/taskly-app
 ```
 
 When using GitHub CLI, pass `--repo Http400/taskly-app`. The real GitHub Actions
-run link is pending that bootstrap and must be added here after the first
-same-repository PR run.
+evidence is linked above.
 
 The minimum version intentionally has no automatic repair, arbitrary fork
 generation, production-code edits, auto-commits, multi-agent orchestration,
